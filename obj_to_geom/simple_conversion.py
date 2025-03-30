@@ -19,7 +19,7 @@ def read_obj(filename):
             if parts[0] == "v":
                 vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
             elif parts[0] == "f":
-                # Faces can have entries like "1//1"; we split and use the first part.
+                # Faces may have entries like "1//1"; we split and use the first number.
                 face = [int(p.split("/")[0]) - 1 for p in parts[1:]]
                 if len(face) >= 3:
                     faces.append(face[:3])
@@ -35,33 +35,43 @@ def write_obj(filename, vertices, faces):
         for face in faces:
             f.write("f {} {} {}\n".format(face[0] + 1, face[1] + 1, face[2] + 1))
 
-def compute_centroid(vertices):
-    """Compute the centroid of the mesh."""
-    return np.mean(vertices, axis=0)
-
-def spherical_uv(vertices):
+def planar_uv(vertices):
     """
-    Compute spherical UV coordinates for each vertex after centering the mesh.
-    u = (atan2(z, x) / (2*pi)) + 0.5,
-    v = acos(y / r) / pi.
+    Compute UV coordinates using a planar projection based on PCA.
+    
+    1. Center the mesh.
+    2. Compute PCA to get the two principal directions.
+    3. Project vertices onto these directions.
+    4. Normalize the projections to [0,1].
     """
-    # Center the vertices by subtracting the centroid
-    centroid = compute_centroid(vertices)
-    centered = vertices - centroid
+    # Center the vertices
+    center = np.mean(vertices, axis=0)
+    centered = vertices - center
 
-    uvs = []
-    for v in centered:
-        x, y, z = v
-        r = np.linalg.norm(v)
-        if r == 0:
-            u, v_coord = 0, 0
-        else:
-            theta = math.atan2(z, x)
-            phi = math.acos(np.clip(y / r, -1.0, 1.0))
-            u = (theta / (2 * math.pi)) + 0.5
-            v_coord = phi / math.pi
-        uvs.append([u, v_coord])
-    return np.array(uvs)
+    # Perform PCA using SVD on the centered vertices.
+    U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    # Take the first two principal components as the UV basis.
+    u_dir = Vt[0]
+    v_dir = Vt[1]
+
+    # Project each vertex onto the principal directions.
+    u = centered.dot(u_dir)
+    v = centered.dot(v_dir)
+
+    # Normalize u and v to [0,1]
+    u_min, u_max = u.min(), u.max()
+    v_min, v_max = v.min(), v.max()
+    if u_max - u_min > 0:
+        u_norm = (u - u_min) / (u_max - u_min)
+    else:
+        u_norm = u
+    if v_max - v_min > 0:
+        v_norm = (v - v_min) / (v_max - v_min)
+    else:
+        v_norm = v
+
+    uv = np.stack((u_norm, v_norm), axis=1)
+    return uv
 
 def barycentric_coords(p, a, b, c):
     """Compute barycentric coordinates of point p with respect to triangle (a, b, c)."""
@@ -105,7 +115,7 @@ def create_geometry_image(vertices, faces, uvs, resolution=256):
         v0, v1, v2 = vertices[idx0], vertices[idx1], vertices[idx2]
         uv0, uv1, uv2 = uvs[idx0], uvs[idx1], uvs[idx2]
 
-        # Map UVs [0,1] to pixel coordinates
+        # Map UVs [0,1] to pixel coordinates.
         p0 = np.array([uv0[0] * (resolution - 1), uv0[1] * (resolution - 1)])
         p1 = np.array([uv1[0] * (resolution - 1), uv1[1] * (resolution - 1)])
         p2 = np.array([uv2[0] * (resolution - 1), uv2[1] * (resolution - 1)])
@@ -115,7 +125,7 @@ def create_geometry_image(vertices, faces, uvs, resolution=256):
         if area == 0:
             continue
 
-        # Bounding box for the triangle
+        # Bounding box for the triangle.
         min_x = int(max(min(p0[0], p1[0], p2[0]), 0))
         max_x = int(min(max(p0[0], p1[0], p2[0]), resolution - 1))
         min_y = int(max(min(p0[1], p1[1], p2[1]), 0))
@@ -126,7 +136,6 @@ def create_geometry_image(vertices, faces, uvs, resolution=256):
                 p = np.array([i, j])
                 bary = barycentric_coords(p, p0, p1, p2)
                 if point_in_triangle(bary):
-                    # Compute weighted interpolation: weight factor is the inverse of the area.
                     weight = 1.0 / area
                     pos = bary[0] * v0 + bary[1] * v1 + bary[2] * v2
                     geo_img[j, i] += pos * weight
@@ -202,14 +211,14 @@ def main():
     if len(sys.argv) > 3:
         resolution = int(sys.argv[3])
     
-    # Read the .obj file
+    # Read the .obj file.
     vertices, faces = read_obj(input_obj)
     print("Read {} vertices and {} faces.".format(len(vertices), len(faces)))
     
-    # Compute improved UV mapping (centering the mesh first)
-    uvs = spherical_uv(vertices)
+    # Compute UV mapping using a planar (PCA-based) projection.
+    uvs = planar_uv(vertices)
     
-    # Create the geometry image using weighted rasterization
+    # Create the geometry image using weighted rasterization.
     geo_img = create_geometry_image(vertices, faces, uvs, resolution=resolution)
     print("Created geometry image of resolution {}x{}.".format(resolution, resolution))
     
