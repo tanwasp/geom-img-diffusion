@@ -35,6 +35,10 @@ def write_obj(filename, vertices, faces):
         for face in faces:
             f.write("f {} {} {}\n".format(face[0] + 1, face[1] + 1, face[2] + 1))
 
+def compute_centroid(vertices):
+    """Compute the centroid of the mesh."""
+    return np.mean(vertices, axis=0)
+
 def planar_uv(vertices):
     """
     Compute UV coordinates using a planar projection based on PCA.
@@ -61,14 +65,8 @@ def planar_uv(vertices):
     # Normalize u and v to [0,1]
     u_min, u_max = u.min(), u.max()
     v_min, v_max = v.min(), v.max()
-    if u_max - u_min > 0:
-        u_norm = (u - u_min) / (u_max - u_min)
-    else:
-        u_norm = u
-    if v_max - v_min > 0:
-        v_norm = (v - v_min) / (v_max - v_min)
-    else:
-        v_norm = v
+    u_norm = (u - u_min) / (u_max - u_min) if (u_max - u_min) > 0 else u
+    v_norm = (v - v_min) / (v_max - v_min) if (v_max - v_min) > 0 else v
 
     uv = np.stack((u_norm, v_norm), axis=1)
     return uv
@@ -201,6 +199,37 @@ def laplacian_smoothing(vertices, faces, iterations=5, lambda_factor=0.5):
         vertices_smoothed = new_vertices
     return vertices_smoothed
 
+def decimate_mesh(vertices, faces, tol=1e-6):
+    """
+    Remove duplicate (or nearly duplicate) vertices and update face indices accordingly.
+    This function rounds vertices based on a tolerance and builds a mapping from old indices to new ones.
+    """
+    unique_vertices = []
+    index_map = {}
+    new_index = 0
+
+    # Use rounding based on tolerance.
+    rounded = np.round(vertices / tol) * tol
+    for i, v in enumerate(rounded):
+        key = tuple(v)
+        if key not in index_map:
+            index_map[key] = new_index
+            unique_vertices.append(vertices[i])
+            new_index += 1
+
+    unique_vertices = np.array(unique_vertices)
+
+    # Remap faces using the mapping.
+    new_faces = []
+    for face in faces:
+        new_face = []
+        for idx in face:
+            key = tuple(rounded[idx])
+            new_face.append(index_map[key])
+        new_faces.append(new_face)
+    new_faces = np.array(new_faces)
+    return unique_vertices, new_faces
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: python script.py input.obj output_prefix [resolution]")
@@ -235,10 +264,15 @@ def main():
     print("Reconstructed mesh has {} vertices and {} faces.".format(len(rec_vertices), len(rec_faces)))
     
     # Apply Laplacian smoothing to the reconstructed mesh.
-    rec_vertices_smoothed = laplacian_smoothing(rec_vertices, rec_faces, iterations=10, lambda_factor=0.4)
+    # rec_vertices_smoothed = laplacian_smoothing(rec_vertices, rec_faces, iterations=10, lambda_factor=0.4)
+    
+    # Decimate the mesh to remove duplicate vertices.
+    decimated_vertices, decimated_faces = decimate_mesh(rec_vertices, rec_faces)
+    print("Decimated mesh has {} vertices and {} faces.".format(len(decimated_vertices), len(decimated_faces)))
+    
     out_obj = output_prefix + "_reconstructed.obj"
-    write_obj(out_obj, rec_vertices_smoothed, rec_faces)
-    print("Saved reconstructed (smoothed) .obj as {}.".format(out_obj))
+    write_obj(out_obj, decimated_vertices, decimated_faces)
+    print("Saved decimated reconstructed .obj as {}.".format(out_obj))
 
 if __name__ == "__main__":
     main()
