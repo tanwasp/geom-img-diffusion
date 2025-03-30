@@ -81,7 +81,7 @@ def parse_obj_counts(obj_filepath):
 results = {}  # Will store category -> stats
 
 for cat_id, cat_name in category_map.items():
-    folder_name = f"{cat_name}-{cat_id}"
+    folder_name = f"{cat_id}"
     cat_path = os.path.join(BASE_DIR, folder_name)
     if not os.path.isdir(cat_path):
         print(f"Warning: Directory for category {cat_name} ({cat_id}) not found at {cat_path}")
@@ -122,7 +122,7 @@ for cat_id, cat_name in category_map.items():
     }
 
 # 5) Write results to a CSV file.
-csv_filename = "shapenet_stats.csv"
+csv_filename = "shapenet_stats_new.csv"
 csv_fields = [
     "category", 
     "num_models", 
