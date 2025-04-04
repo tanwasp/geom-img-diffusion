@@ -3,32 +3,51 @@ from PIL import Image
 import trimesh
 import argparse
 
+def debug_vertex_stats(vertices, label="Vertices"):
+    min_coords = vertices.min(axis=0)
+    max_coords = vertices.max(axis=0)
+    print(f"DEBUG {label} Stats:")
+    print("  Min: ", min_coords)
+    print("  Max: ", max_coords)
+    print("  Range: ", max_coords - min_coords)
+    center = (min_coords + max_coords) / 2.0
+    scale = (max_coords - min_coords).max()
+    print("  Center: ", center)
+    print("  Scale: ", scale)
+    return center, scale
+
+def debug_uv_stats(uvs):
+    if uvs.size == 0:
+        print("DEBUG: No UV coordinates found.")
+        return None, None, None
+    min_uv = uvs.min(axis=0)
+    max_uv = uvs.max(axis=0)
+    print("DEBUG UV Stats:")
+    print("  Shape: ", uvs.shape)
+    print("  First 5 UVs:\n", uvs[:5])
+    print("  Min: ", min_uv)
+    print("  Max: ", max_uv)
+    print("  Range: ", max_uv - min_uv)
+    unique_uv = np.unique(uvs, axis=0)
+    print("DEBUG: Number of unique UVs:", unique_uv.shape[0])
+    return min_uv, max_uv, unique_uv
+
 def load_obj(file_path):
-    """
-    Load an OBJ file using trimesh.
-    If a Scene is returned, merge all geometry into one mesh.
-    """
     mesh_or_scene = trimesh.load(file_path, process=False)
     if isinstance(mesh_or_scene, trimesh.Scene):
-        # Merge all geometry into a single mesh.
         mesh = trimesh.util.concatenate(tuple(mesh_or_scene.geometry.values()))
     else:
         mesh = mesh_or_scene
+    print("DEBUG: Loaded mesh with {} vertices and {} faces".format(len(mesh.vertices), len(mesh.faces)))
     return mesh
 
-
 def barycentric_weights(tri, p):
-    """
-    Compute barycentric weights for point p (2,) with respect to triangle tri (3,2).
-    Returns a numpy array [w0, w1, w2]. If the triangle is degenerate, returns negative weights.
-    """
-    # Set up the linear system:
-    # p = w0 * v0 + w1 * v1 + w2 * v2, with w2 = 1 - w0 - w1.
+    # Solve for barycentrics such that p = w0*v0 + w1*v1 + (1-w0-w1)*v2
     A = np.array([
         [tri[0,0] - tri[2,0], tri[1,0] - tri[2,0]],
         [tri[0,1] - tri[2,1], tri[1,1] - tri[2,1]]
     ])
-    b = np.array([p[0]-tri[2,0], p[1]-tri[2,1]])
+    b = np.array([p[0] - tri[2,0], p[1] - tri[2,1]])
     try:
         sol = np.linalg.solve(A, b)
         w0, w1 = sol
@@ -37,72 +56,112 @@ def barycentric_weights(tri, p):
     except np.linalg.LinAlgError:
         return np.array([-1, -1, -1])
 
+def compute_pca_uv(mesh):
+    """
+    Compute UV coordinates based on a PCA projection.
+    This finds the best-fit plane for the mesh vertices using SVD,
+    then projects each vertex onto the first two principal directions.
+    The UVs are then normalized to the [0,1] range.
+    """
+    vertices = mesh.vertices
+    center = np.mean(vertices, axis=0)
+    centered = vertices - center
+    # SVD: the first two columns of Vt give the dominant directions.
+    U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    # Use the first two principal directions.
+    basis = Vt[:2, :]  # shape: (2,3)
+    uv = centered.dot(basis.T)  # shape: (n,2)
+    # Normalize the UV coordinates to [0,1]
+    min_uv = uv.min(axis=0)
+    max_uv = uv.max(axis=0)
+    uv_norm = (uv - min_uv) / (max_uv - min_uv)
+    print("DEBUG: PCA-based UV Stats:")
+    debug_uv_stats(uv_norm)
+    return uv_norm
+
 def create_geometry_image(mesh, resolution=256):
-    """
-    Create a geometry image from the mesh.
-    The mesh is assumed to have UV coordinates; if not, a simple planar projection is used.
-    For each face, we rasterize the triangle in UV space and use barycentric interpolation to assign 3D vertex positions.
-    """
-    # Use provided UV mapping or compute a simple planar mapping from the x-y coordinates.
-    if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
-        uv = mesh.visual.uv
-    else:
-        # Compute UVs by normalizing the first two coordinates of the vertices
-        verts2d = mesh.vertices[:, :2]
-        uv = (verts2d - verts2d.min(axis=0)) / (verts2d.max(axis=0) - verts2d.min(axis=0))
+    # Debug the original mesh vertices.
+    center, scale = debug_vertex_stats(mesh.vertices, label="Original Mesh Vertices")
     
-    # Initialize an empty geometry image (float32 image storing [x,y,z] per pixel)
+    # Attempt to use the provided UV mapping.
+    uv = None
+    if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None and len(mesh.visual.uv) > 0:
+        if hasattr(mesh.visual, 'uv_index') and mesh.visual.uv_index is not None:
+            uv = mesh.visual.uv[mesh.visual.uv_index]
+            print("DEBUG: Using mesh UV coordinates with uv_index. UV shape:", uv.shape)
+        else:
+            uv = mesh.visual.uv
+            print("DEBUG: Using mesh UV coordinates. UV shape:", uv.shape)
+    else:
+        print("DEBUG: No UVs found.")
+
+    # If we have UVs, check for degeneracy.
+    if uv is not None:
+        min_uv, max_uv, unique_uv = debug_uv_stats(uv)
+        uv_range = max_uv - min_uv if min_uv is not None and max_uv is not None else np.array([0, 0])
+        if np.any(uv_range < 1e-3) or (unique_uv is not None and unique_uv.shape[0] <= 1):
+            print("WARNING: Provided UV mapping is degenerate.")
+            uv = None
+
+    # If no valid UV mapping is available, compute our own using PCA.
+    if uv is None:
+        print("DEBUG: Falling back to computing UV mapping using PCA-based projection.")
+        uv = compute_pca_uv(mesh)
+    
+    # Initialize the geometry image (storing float positions).
     geom_img = np.zeros((resolution, resolution, 3), dtype=np.float32)
 
-    # For each face, get its three vertices and corresponding uv coordinates.
+    # Rasterize each face into the geometry image.
     for face in mesh.faces:
-        # Get uv coordinates for the three vertices (shape: 3x2)
-        uv_face = uv[face]
-        # Convert UVs to image pixel coordinates (assume UV range [0,1])
-        uv_pixels = uv_face * (resolution - 1)
-        # Get the 3D vertex positions for the face (shape: 3x3)
-        verts = mesh.vertices[face]
+        uv_face = uv[face]              # shape (3,2)
+        uv_pixels = uv_face * (resolution - 1)  # Scale UVs to pixel coordinates.
+        verts = mesh.vertices[face]      # shape (3,3)
 
-        # Compute bounding box of the triangle in pixel space
+        # Compute the bounding box in pixel space.
         min_x = int(np.floor(np.min(uv_pixels[:, 0])))
         max_x = int(np.ceil(np.max(uv_pixels[:, 0])))
         min_y = int(np.floor(np.min(uv_pixels[:, 1])))
         max_y = int(np.ceil(np.max(uv_pixels[:, 1])))
 
-        # Loop over pixels in the bounding box
+        # Compute triangle area in UV space.
+        tri_area = 0.5 * abs(np.linalg.det(np.array([
+            [uv_face[1,0] - uv_face[0,0], uv_face[2,0] - uv_face[0,0]],
+            [uv_face[1,1] - uv_face[0,1], uv_face[2,1] - uv_face[0,1]]
+        ])))
+        if tri_area < 1e-6:
+            # print("DEBUG: Skipping degenerate face with area:", tri_area)
+            continue
+
+        # Loop over pixels in the bounding box.
         for i in range(min_x, max_x + 1):
             for j in range(min_y, max_y + 1):
                 p = np.array([i, j])
-                # Compute barycentric weights for p in the triangle defined by uv_pixels.
                 w = barycentric_weights(uv_pixels, p)
-                # Check if the point lies inside the triangle.
                 if np.all(w >= 0):
-                    # Interpolate the 3D position using the barycentrics.
                     pos = w[0] * verts[0] + w[1] * verts[1] + w[2] * verts[2]
-                    # Note: image coordinate (j,i): j is row (y) and i is column (x)
                     geom_img[j, i, :] = pos
 
-    # For saving as a PNG we need to convert float data to 8-bit.
-    # We linearly scale the geometry values based on the min and max across the image.
+    # Scale the geometry image to 8-bit values for saving.
     min_val = geom_img.min()
     max_val = geom_img.max()
-    geom_img_scaled = (geom_img - min_val) / (max_val - min_val) * 255
-    geom_img_scaled = geom_img_scaled.astype(np.uint8)
+    print("DEBUG Geometry Image Stats:")
+    print("  Min value:", min_val)
+    print("  Max value:", max_val)
+    if max_val - min_val == 0:
+        print("WARNING: Geometry image values are all zero. Something went wrong during rasterization!")
+        geom_img_scaled = np.zeros_like(geom_img, dtype=np.uint8)
+    else:
+        geom_img_scaled = (geom_img - min_val) / (max_val - min_val) * 255
+        geom_img_scaled = geom_img_scaled.astype(np.uint8)
     return geom_img_scaled, (min_val, max_val)
 
 def reconstruct_obj_from_geometry_image(geom_img, scale_params, resolution=256):
-    """
-    Reconstruct a mesh from a geometry image.
-    Each pixel becomes a vertex (after reversing the scale) and faces are generated as a grid.
-    """
     min_val, max_val = scale_params
-    # Reverse the scaling to get back to the original float values.
+    # Reverse scaling from 8-bit back to float values.
     geom_float = geom_img.astype(np.float32) / 255 * (max_val - min_val) + min_val
-    # Each pixel is a vertex; reshape the image to a list of vertices.
     vertices = geom_float.reshape(-1, 3)
     faces = []
-
-    # Create faces by connecting vertices in the grid (two triangles per grid cell)
+    # Create grid connectivity (two triangles per cell)
     for i in range(resolution - 1):
         for j in range(resolution - 1):
             idx = i * resolution + j
@@ -112,17 +171,15 @@ def reconstruct_obj_from_geometry_image(geom_img, scale_params, resolution=256):
             faces.append([idx, idx_down, idx_right])
             faces.append([idx_right, idx_down, idx_down_right])
     faces = np.array(faces)
+    print("DEBUG: Reconstructed mesh with {} vertices and {} faces".format(len(vertices), len(faces)))
     return vertices, faces
 
 def write_obj(file_path, vertices, faces):
-    """
-    Write the vertices and faces to an OBJ file.
-    """
     with open(file_path, 'w') as f:
         for v in vertices:
             f.write("v {} {} {}\n".format(v[0], v[1], v[2]))
         for face in faces:
-            # OBJ indices are 1-based.
+            # OBJ file indices are 1-based.
             f.write("f {} {} {}\n".format(face[0] + 1, face[1] + 1, face[2] + 1))
 
 def main():
@@ -135,19 +192,15 @@ def main():
     parser.add_argument("--resolution", type=int, default=256, help="Resolution of the geometry image")
     args = parser.parse_args()
 
-    # Load the input OBJ mesh.
     mesh = load_obj(args.input_obj)
-    # Create the geometry image.
     geom_img, scale_params = create_geometry_image(mesh, args.resolution)
-    # Save the geometry image.
     Image.fromarray(geom_img).save(args.output_geo)
-    print("Geometry image saved to", args.output_geo)
+    print("DEBUG: Geometry image saved to", args.output_geo)
 
-    # For the reconstruction, we simulate reading back the geometry image.
     geom_img_recon = np.array(Image.open(args.output_geo))
     vertices, faces = reconstruct_obj_from_geometry_image(geom_img_recon, scale_params, args.resolution)
     write_obj(args.output_obj, vertices, faces)
-    print("Reconstructed OBJ saved to", args.output_obj)
+    print("DEBUG: Reconstructed OBJ saved to", args.output_obj)
 
 if __name__ == "__main__":
     main()
