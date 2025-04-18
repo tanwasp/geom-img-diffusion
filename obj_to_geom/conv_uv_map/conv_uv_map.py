@@ -3,6 +3,8 @@ from PIL import Image
 import trimesh
 import argparse
 import math
+import xatlas
+# import igl
 
 def debug_vertex_stats(vertices, label="Vertices"):
     if vertices.size == 0:
@@ -149,7 +151,87 @@ def barycentric_weights(tri, p):
     except np.linalg.LinAlgError:
         # print("DEBUG: LinAlgError during barycentric calculation.")
         return np.array([-1.0, -1.0, -1.0])
+    
+# def compute_lscm_uv(mesh):
+#     V = mesh.vertices      # (n,3)
+#     F = mesh.faces         # (m,3)
 
+#     # 1. Find a boundary loop (just one, for genus-zero meshes)
+#     bnd = igl.boundary_loop(F)
+#     if len(bnd) < 3:
+#         print("WARNING: mesh has no boundary; can't do a single chart LSCM.")
+#         return None
+
+#     # 2. Pin two boundary vertices to fixed UV locations 
+#     #    (prevent trivial solution).  We pick the two farthest apart.
+#     #    Then place them at (0,0) and (1,0).
+#     dists = np.linalg.norm(V[bnd][:,None] - V[bnd][None,:], axis=2)
+#     i,j = np.unravel_index(np.argmax(dists), dists.shape)
+#     bnd_indices = np.array([bnd[i], bnd[j]])
+#     bnd_uv = np.array([[0.0,0.0], [1.0,0.0]])
+
+#     # 3. Solve the LSCM system
+#     uv = igl.lscm(V, F, bnd_indices, bnd_uv)
+
+#     # 4. Normalize UV to [0,1]
+#     min_uv, max_uv = uv.min(axis=0), uv.max(axis=0)
+#     uv_range = max_uv - min_uv
+#     uv_range[uv_range < 1e-6] = 1.0
+#     uv = (uv - min_uv) / uv_range
+
+#     # Debug
+#     print("DEBUG LSCM UV:", "min", uv.min(0), "max", uv.max(0))
+#     return uv
+
+def compute_xatlas_uv(mesh):
+    # mesh.vertices: (n,3) float32, mesh.faces: (m,3) int32
+    vmapping, indices, uvs = xatlas.parametrize(
+        mesh.vertices.astype('float32'),
+        mesh.faces.astype('uint32')
+    )
+    # vmapping[i] tells you which original vertex this new UV vertex came from.
+    # Build per‑vertex UVs by averaging duplicates:
+    uv_per_vertex = np.zeros((len(mesh.vertices), 2), dtype='float32')
+    counts = np.zeros(len(mesh.vertices), dtype=int)
+    for new_idx, orig_idx in enumerate(vmapping):
+        uv_per_vertex[orig_idx] += uvs[new_idx]
+        counts[orig_idx] += 1
+    # avoid divide‑by‑zero
+    nonzero = counts > 0
+    uv_per_vertex[nonzero] /= counts[nonzero, None]
+    return uv_per_vertex
+    
+def compute_spherical_uv(mesh):
+    """
+    Compute UV coordinates using spherical projection.
+    Better than PCA for most 3D models, especially closed surfaces.
+    """
+    vertices = mesh.vertices
+    
+    # Center the mesh
+    center = np.mean(vertices, axis=0)
+    centered = vertices - center
+    
+    # Convert to spherical coordinates
+    x, y, z = centered.T
+    radius = np.sqrt(x**2 + y**2 + z**2)
+    
+    # Handle zero radius case
+    zero_radius = radius < 1e-6
+    radius[zero_radius] = 1e-6
+    
+    # Compute spherical coordinates
+    theta = np.arctan2(z, x)  # azimuthal angle
+    phi = np.arccos(np.clip(y / radius, -1.0, 1.0))  # polar angle
+    
+    # Map to UV space [0,1]
+    u = (theta / (2 * np.pi)) + 0.5
+    v = phi / np.pi
+    
+    uv = np.stack([u, v], axis=1)
+    print("DEBUG: Spherical UV Stats:")
+    debug_uv_stats(uv, "Spherical UV")
+    return uv
 
 def compute_pca_uv(mesh):
     """Compute UV coordinates based on PCA projection for a *single* mesh."""
@@ -269,7 +351,10 @@ def get_or_compute_uv_for_mesh(mesh, mesh_index):
     # If no valid UV mapping was found or derived from the mesh, compute using PCA.
     if uv is None:
         print(f"DEBUG Mesh {mesh_index}: No valid existing UVs found. Computing UV mapping using PCA.")
-        uv = compute_pca_uv(mesh)
+        # uv = compute_pca_uv(mesh)
+        # uv = compute_spherical_uv(mesh)
+        # uv = compute_lscm_uv(mesh)
+        uv = compute_xatlas_uv(mesh)
         if uv is None:
              print(f"ERROR Mesh {mesh_index}: Failed to compute PCA UVs.")
              # Cannot proceed with this mesh part
